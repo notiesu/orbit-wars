@@ -1,0 +1,7 @@
+*.zip
+*.csv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.DS_Store
