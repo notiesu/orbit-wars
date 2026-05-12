@@ -60,9 +60,9 @@ PATH_SEARCH_RADIUS_MIN = 18.0
 PATH_SEARCH_RADIUS_FACTOR = 5.0
 
 # Local value multipliers
-PLANET_VALUE_PRODUCTION_FACTOR = 8.0
+PLANET_VALUE_PRODUCTION_FACTOR = 10.0
 PLANET_VALUE_SHIP_FACTOR = 0.03
-PRODUCTION_VALUE_FACTOR = 8.0
+PRODUCTION_VALUE_FACTOR = 10.0
 
 # Defense reserve
 DEFENSE_RESERVE_FACTOR = 0.2
@@ -80,8 +80,10 @@ COMMITMENT_SPEED_DIVISOR = 3
 MIN_FLEET_SPEED = 1.0
 
 # Capture probability / uncertainty
-DEFENSE_UNCERTAINTY_FACTOR = 0.02
-CAPTURE_SIGMOID_K = 0.3
+DEFENSE_UNCERTAINTY_FACTOR = 0.06
+# Ratio-based sigmoid: log(commitment/defense) scaled by K
+# K=2.0 gives: ratio 1.1 -> ~55% prob, ratio 2.0 -> ~80% prob, ratio 10 -> ~99% prob
+CAPTURE_SIGMOID_K = 2.0
 
 # Economic / pressure bonuses
 # INCREMENTAL_OWNERSHIP_BONUS_NEUTRAL = 1.0
@@ -99,15 +101,16 @@ EARLY_CONTEST_SHIP_SCALE = 30.0
 EARLY_CONTEST_PROD_SCALE = 4.0
 EARLY_CONTEST_BONUS_CAP = 0.75
 EARLY_CONTEST_BONUS_MULTIPLIER = 0.9
+CONTEST_RATIO_THRESHOLD = 0.5
 
 # Overkill / distance penalties
 OVERKILL_PENALTY_FACTOR = 0.03
 OVERKILL_PENALTY_CAP = 1.5
 # Distance is already represented through travel time, so keep this soft.
-DISTANCE_PENALTY_FACTOR = 0.03
+DISTANCE_PENALTY_FACTOR = 0.005
 
 # Movement-aware capture shaping
-MOVING_AWAY_DISTANCE_PENALTY_FACTOR = 1.0
+MOVING_AWAY_DISTANCE_PENALTY_FACTOR = 0.75
 # Agent / commitment defaults
 AVAILABLE_MIN_TO_CONSIDER = 2
 INITIAL_COMMITMENT = 2
@@ -143,10 +146,10 @@ MIN_LAUNCH_COMMITMENT = 0
 
 
 EXPANSION_FACTOR_MIN = 0.5
-EXPANSION_FACTOR_MAX = 1.5
+EXPANSION_FACTOR_MAX = 2.5
 
 # optional shaping exponent
-EXPANSION_FACTOR_CURVE = 0.75
+EXPANSION_FACTOR_CURVE = 1.25
 
 # =====================================================
 # Defense / pressure modeling
@@ -166,18 +169,40 @@ FRIENDLY_DEFENSE_WEIGHT = 0.25
 # Tempo / payback
 # =====================================================
 
-TEMPO_PENALTY_FACTOR = 0.035
+TEMPO_PENALTY_FACTOR = 0.01
 PAYBACK_COMMITMENT_EXPONENT = 0.7
 
 # Encourage larger waves to reach a reliable capture force.
 ASSAULT_BUFFER_FACTOR = 1.1
-UNDERCOMMITMENT_PENALTY_FACTOR = 0.5
+UNDERCOMMITMENT_PENALTY_FACTOR = 0.75
+
+# Reward lower arrival times from added ships, while keeping the scale bounded.
+ARRIVAL_TIME_DELTA_FACTOR = 0.5
+ARRIVAL_TIME_DELTA_CAP = 1.5
+
+# =====================================================
+# Production delta
+# =====================================================
+
+# Bonus for capturing high-production targets from low-production sources.
+# Encourages fast seizure of production capability upgrades.
+# Ratio-based: target_prod / (source_prod + 1) scaled by factor
+PRODUCTION_DELTA_BONUS_FACTOR = 0.15
 
 # =====================================================
 # Overcommitment
 # =====================================================
 
-OVERCOMMITMENT_PENALTY_FACTOR = 0.5
+OVERCOMMITMENT_PENALTY_FACTOR = 0.0
+
+# =====================================================
+# Commitment lookahead
+# =====================================================
+
+# When searching for best commitment, use lookahead to avoid fragmenting into multiple small launches.
+# If the next increment's marginal ROI is also strong (above this ratio of threshold),
+# the current commitment is too small—keep searching.
+COMMITMENT_LOOKAHEAD_RATIO = 0.7  # If next marginal is > 70% of threshold, keep searching
 
 # =====================================================
 # Contest / local support
@@ -191,9 +216,13 @@ OVERCOMMITMENT_PENALTY_FACTOR = 0.5
 CONTEST_BONUS_FACTOR = 1.0
 CONTEST_BONUS_CAP = 3.0
 
+# Directional expansion bonus
+# Encourages spreading across board rather than one-directional pushes
+DIRECTIONAL_WEAKNESS_BONUS_FACTOR = 0.05
+
 # =====================================================
 # Ownership modifiers
-# =====================================================
+# ======================================================
 
 OWNERSHIP_NEUTRAL_FACTOR = 1.0
 OWNERSHIP_FRIENDLY_FACTOR = 0.7
@@ -389,6 +418,45 @@ def early_enemy_contest_bonus(target: PlanetState, player: int) -> float:
     )
 
 
+def directional_weakness_bonus(target: PlanetState, game_state: AgentGameState, player: int) -> float:
+    """Bonus for expanding into directionally weak areas.
+    Returns multiplier ~1.0 to ~1.3 based on target direction.
+    """
+    allied_planets = [p for p in game_state.planets if p.owner == player]
+    if not allied_planets:
+        return 1.0
+
+    # Player's center of mass
+    center_x = sum(p.x for p in allied_planets) / len(allied_planets)
+    center_y = sum(p.y for p in allied_planets) / len(allied_planets)
+
+    # Angle from center to target
+    target_angle = math.atan2(target.y - center_y, target.x - center_x)
+
+    # Measure allied strength in target direction vs opposite
+    strength_toward = 0.0
+    strength_away = 0.0
+
+    for planet in game_state.planets:
+        if planet.owner != player or planet.id == target.id:
+            continue
+
+        angle = math.atan2(planet.y - center_y, planet.x - center_x)
+        angle_diff = abs(angle - target_angle)
+        if angle_diff > math.pi:
+            angle_diff = 2 * math.pi - angle_diff
+
+        strength = planet.ships + planet.production * PLANET_VALUE_PRODUCTION_FACTOR
+        if angle_diff < math.pi / 4:  # 45° cone toward target
+            strength_toward += strength
+        elif angle_diff > 3 * math.pi / 4:  # opposite direction
+            strength_away += strength
+
+    # Bonus if we're weak in target direction
+    weakness_ratio = (strength_away + 1.0) / (strength_toward + 1.0)
+    return 1.0 + min(0.3, weakness_ratio * DIRECTIONAL_WEAKNESS_BONUS_FACTOR)
+
+
 # =========================================================
 # PATHING
 # =========================================================
@@ -489,6 +557,7 @@ def incremental_roi(
     expansion_factor: float = 1.0,
     source_angular_velocity: float = 0.0,
     target_angular_velocity: float = 0.0,
+    travel_turns_cache: dict | None = None,
 ) -> float:
 
     # =====================================================
@@ -506,38 +575,60 @@ def incremental_roi(
 
     distance = dist(entity_pos(source), entity_pos(target))
 
-    speed = compute_fleet_speed(
-        max(
-            MIN_COMMITMENT_FOR_SPEED,
-            new_commitment // COMMITMENT_SPEED_DIVISOR,
+    if travel_turns_cache is None:
+        travel_turns_cache = {}
+
+    def effective_travel_turns_for(commitment: int) -> float:
+        cached_turns = travel_turns_cache.get(commitment)
+        if cached_turns is not None:
+            return cached_turns
+
+        speed = compute_fleet_speed(
+            max(
+                MIN_COMMITMENT_FOR_SPEED,
+                commitment // COMMITMENT_SPEED_DIVISOR,
+            )
         )
-    )
 
-    #a rough estimate
-    travel_turns = distance / max(MIN_FLEET_SPEED, speed)
+        travel_turns = distance / max(MIN_FLEET_SPEED, speed)
 
-    predicted_separation = projected_separation(
-        source,
-        target,
-        travel_turns,
-        source_angular_velocity,
-        target_angular_velocity,
-    )
+        predicted_separation = projected_separation(
+            source,
+            target,
+            travel_turns,
+            source_angular_velocity,
+            target_angular_velocity,
+        )
 
-    separation_delta = max(0.0, predicted_separation - distance)
-    moving_away_turns = (
-        separation_delta
-        / max(MIN_FLEET_SPEED, speed)
-        * MOVING_AWAY_DISTANCE_PENALTY_FACTOR
+        separation_delta = max(0.0, predicted_separation - distance)
+        moving_away_turns = (
+            separation_delta
+            / max(MIN_FLEET_SPEED, speed)
+            * MOVING_AWAY_DISTANCE_PENALTY_FACTOR
+        )
+
+        cached_turns = travel_turns + moving_away_turns
+        travel_turns_cache[commitment] = cached_turns
+        return cached_turns
+
+    baseline_travel_turns = effective_travel_turns_for(current_commitment)
+    effective_travel_turns = effective_travel_turns_for(new_commitment)
+    arrival_time_delta = baseline_travel_turns - effective_travel_turns
+
+    arrival_time_multiplier = 1.0 + max(
+        -ARRIVAL_TIME_DELTA_CAP,
+        min(
+            ARRIVAL_TIME_DELTA_CAP,
+            arrival_time_delta * ARRIVAL_TIME_DELTA_FACTOR,
+        ),
     )
-    effective_travel_turns = travel_turns + moving_away_turns
 
     # =====================================================
     # Defensive projection
     # =====================================================
 
     projected_defense = (
-        target.ships
+        target.ships * (1.0 + DEFENSE_UNCERTAINTY_FACTOR * effective_travel_turns)
         + target.production * effective_travel_turns
     )
 
@@ -565,10 +656,11 @@ def incremental_roi(
     )
 
     # =====================================================
-    # Capture probability
+    # Capture probability (ratio-based)
     # =====================================================
 
-    margin = new_commitment - effective_defense
+    # Use commitment ratio vs defense for natural incremental scaling
+    commitment_ratio = new_commitment / max(1.0, effective_defense)
 
     def safe_sigmoid(x: float) -> float:
         if x > 50:
@@ -578,7 +670,7 @@ def incremental_roi(
         return 1.0 / (1.0 + math.exp(-x))
 
     capture_probability = safe_sigmoid(
-        margin * CAPTURE_SIGMOID_K
+        math.log(max(0.1, commitment_ratio)) * CAPTURE_SIGMOID_K
     )
 
     # =====================================================
@@ -662,10 +754,7 @@ def incremental_roi(
 
     distance_penalty = (
         1.0
-        + (
-            distance
-            + separation_delta * MOVING_AWAY_DISTANCE_PENALTY_FACTOR
-        ) * DISTANCE_PENALTY_FACTOR
+        + distance * DISTANCE_PENALTY_FACTOR
     )
 
     # =====================================================
@@ -676,6 +765,15 @@ def incremental_roi(
         (local_allied + 1.0)
         / (local_enemy + 1.0)
     )
+
+    #if local enemy is strong, penalize heavily to encourage building local support first
+    if contest_ratio < CONTEST_RATIO_THRESHOLD:
+        contest_penalty = (
+            1.0
+            + (CONTEST_RATIO_THRESHOLD - contest_ratio)
+            * CONTEST_PRESSURE_MULTIPLIER
+        )
+
 
     contest_bonus = (
         1.0
@@ -714,15 +812,39 @@ def incremental_roi(
     # =====================================================
 
     # =====================================================
+    # Production delta bonus
+    # =====================================================
+
+    # Reward capturing high-production targets from low-production sources
+    production_delta = target.production - source.production
+    if production_delta > 0:
+        production_delta_ratio = production_delta / max(1.0, source.production)
+        production_delta_bonus = (
+            1.0
+            + min(
+                0.5,  # Cap the bonus to avoid extreme values
+                production_delta_ratio * PRODUCTION_DELTA_BONUS_FACTOR,
+            )
+        )
+    else:
+        production_delta_bonus = 1.0
+
+    # =====================================================
     # Final value assembly
     # =====================================================
 
    
+    directional_bonus = directional_weakness_bonus(target, game_state, player)
+
     gross_value = (
+
         production_value
         * contest_bonus
         * ownership_modifier
         * expansion_factor
+        * directional_bonus
+        * production_delta_bonus
+        * arrival_time_multiplier
     )
 
     
@@ -737,6 +859,7 @@ def incremental_roi(
         * overcommitment_penalty
         * undercommitment_penalty
         * distance_penalty
+        * (contest_penalty if contest_ratio < CONTEST_RATIO_THRESHOLD else 1.0)
     )
 
     roi = expected_value / max(1e-6, total_penalty)
@@ -963,6 +1086,7 @@ class IncrementalAgent:
 
                 best_score = BEST_SCORE_INIT
                 best_commitment = 0
+                travel_turns_cache = {}
 
                 speed_est = compute_fleet_speed(
                     max(
@@ -1000,7 +1124,6 @@ class IncrementalAgent:
                 ex_factor = expansion_factor(*calculate_base(planets, inner_planets, outer_planets))
                 while commitment <= available:
                     
-					#it should be maximizing roi, but if the maximized roi is below the threshold, it should not launch at all, so we can just check marginal roi against threshold and stop when it drops below, then launch the best commitment found
                     marginal = incremental_roi(
                         target,
                         source,
@@ -1008,9 +1131,10 @@ class IncrementalAgent:
                         commitment - increment,
                         game_state,
                         player=player,
-                        expansion_factor=ex_factor if target.id in outer_planets else 1.0, # only apply expansion factor to outer planets
+                        expansion_factor=ex_factor if target.id in inner_planets else 1.0,
                         source_angular_velocity=source_angular_velocity,
                         target_angular_velocity=target_angular_velocity,
+                        travel_turns_cache=travel_turns_cache,
                     )
 
                     total_score += marginal
@@ -1019,12 +1143,36 @@ class IncrementalAgent:
                         best_score = total_score
                         best_commitment = commitment
 
-                    # stop when marginal utility collapses
+                    # stop when marginal utility collapses, BUT with lookahead:
+                    # if the next increment would also be strong, don't stop yet (avoid fragmentation)
+                    should_stop = False
                     if (
                         marginal < roi_threshold
                         and commitment > COMMITMENT_STOP_MIN
                         and commitment > min_assault_commitment
                     ):
+                        # Lookahead: would the next increment also be weak?
+                        next_commitment = commitment + increment
+                        if next_commitment <= available:
+                            next_marginal = incremental_roi(
+                                target,
+                                source,
+                                increment,
+                                next_commitment - increment,
+                                game_state,
+                                player=player,
+                                expansion_factor=ex_factor if target.id in inner_planets else 1.0,
+                                source_angular_velocity=source_angular_velocity,
+                                target_angular_velocity=target_angular_velocity,
+                                travel_turns_cache=travel_turns_cache,
+                            )
+                            # Only stop if next increment is also weak (below lookahead threshold)
+                            if next_marginal < roi_threshold * COMMITMENT_LOOKAHEAD_RATIO:
+                                should_stop = True
+                        else:
+                            should_stop = True
+
+                    if should_stop:
                         break
 
                     commitment += increment
