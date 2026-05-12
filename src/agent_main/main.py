@@ -1,6 +1,6 @@
-from simple_agent import SimpleAgent2
+from agent3 import IncrementalAgent
 
-bot = SimpleAgent2(initial_roi_threshold=0.25, ending_roi_threshold=1.45)
+bot = IncrementalAgent()
 
 def agent(obs):
     return bot.predict(obs)

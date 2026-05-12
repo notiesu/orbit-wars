@@ -8,6 +8,10 @@ SUN_RADIUS = 10.0
 
 MAX_FLEET_SPEED = 6.0
 
+# Fleet spawn mechanics
+# Fleets spawn just outside the source planet's radius in the launch direction
+FLEET_SPAWN_OFFSET = 0.0  # Additional offset beyond planet radius (0.0 = spawn at planet edge)
+
 
 # ----------------------------
 # Basic geometry helpers
@@ -15,6 +19,19 @@ MAX_FLEET_SPEED = 6.0
 
 def dist(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def fleet_spawn_position(planet_pos: Tuple, planet_radius: float, launch_angle: float) -> Tuple:
+    """
+    Calculate where a fleet spawns from a planet.
+    Fleet spawns at (planet_radius + FLEET_SPAWN_OFFSET) distance from planet center
+    in the direction of launch_angle.
+    """
+    px, py = planet_pos
+    spawn_dist = planet_radius + FLEET_SPAWN_OFFSET
+    spawn_x = px + spawn_dist * math.cos(launch_angle)
+    spawn_y = py + spawn_dist * math.sin(launch_angle)
+    return (spawn_x, spawn_y)
 
 
 def clamp(v, lo, hi):
@@ -123,6 +140,36 @@ def predict_target(pos, t, omega):
     return predict_orbit_position(pos, t, omega)
 
 
+def angle_intersects_sun(source, angle, sun_pos, sun_radius, source_radius=0.0, max_dist=float("inf")):
+    sx, sy = source
+    cx, cy = sun_pos
+
+    dx = math.cos(angle)
+    dy = math.sin(angle)
+
+    # Fleets begin at the edge of the source planet in the launch direction.
+    sx += dx * source_radius
+    sy += dy * source_radius
+
+    # vector from source to sun center
+    fx = cx - sx
+    fy = cy - sy
+
+    # project center onto ray
+    t = fx * dx + fy * dy
+
+    # behind source or beyond target range
+    if t < 0 or t > max_dist:
+        return False
+
+    # closest point on ray to sun center
+    closest_x = sx + t * dx
+    closest_y = sy + t * dy
+
+    dist_sq = (closest_x - cx) ** 2 + (closest_y - cy) ** 2
+
+    return dist_sq <= sun_radius ** 2
+
 def is_inner_planet(pos, radius):
     #orbital_radius + planet_radius < 50
     cx, cy = SUN_POS
@@ -151,18 +198,47 @@ def intercept_time(source, target_pos, omega, speed, max_t=500, iters=250):
     return (lo + hi) / 2
 
 
-def calculate_interception_angle(source_pos, target_pos, target_angular_velocity, ships, source_angular_velocity=0.0, launch_delay=0.0):
+def calculate_interception_angle(
+    source_pos,
+    target_pos,
+    target_angular_velocity,
+    ships,
+    source_angular_velocity=0.0,
+    launch_delay=0.0,
+    source_radius=0.0,
+    iterations=12,
+):
+    """
+    Calculate launch angle from the actual fleet spawn point.
+
+    Fleets spawn just outside the source planet's radius in the chosen direction,
+    so the launch angle must be solved using the spawn point, not the planet center.
+    """
     speed = compute_fleet_speed(ships)
 
-    launch_source_pos = predict_orbit_position(source_pos, launch_delay, source_angular_velocity)
-    if target_angular_velocity == 0.0:
-        # static target, just aim at current position
-        return math.atan2(target_pos[1] - launch_source_pos[1], target_pos[0] - launch_source_pos[0])
-    t = intercept_time(launch_source_pos, target_pos, target_angular_velocity, speed)
+    angle = math.atan2(target_pos[1] - source_pos[1], target_pos[0] - source_pos[0])
 
-    tx, ty = predict_target(target_pos, launch_delay + t, target_angular_velocity)
+    for _ in range(iterations):
+        spawn_pos = fleet_spawn_position(source_pos, source_radius, angle)
+        launch_source_pos = predict_orbit_position(spawn_pos, launch_delay, source_angular_velocity)
 
-    return math.atan2(ty - launch_source_pos[1], tx - launch_source_pos[0])
+        if target_angular_velocity == 0.0:
+            next_angle = math.atan2(
+                target_pos[1] - launch_source_pos[1],
+                target_pos[0] - launch_source_pos[0],
+            )
+        else:
+            t = intercept_time(launch_source_pos, target_pos, target_angular_velocity, speed)
+            tx, ty = predict_target(target_pos, launch_delay + t, target_angular_velocity)
+            next_angle = math.atan2(ty - launch_source_pos[1], tx - launch_source_pos[0])
+
+        angle_delta = math.atan2(math.sin(next_angle - angle), math.cos(next_angle - angle))
+        angle = next_angle
+
+        if abs(angle_delta) < 1e-9:
+            break
+
+    return angle
 
 def move_fleet(f: Fleet):
     dx = math.cos(f.angle) * f.speed

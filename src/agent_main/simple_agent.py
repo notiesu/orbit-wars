@@ -11,8 +11,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Sequence, Tuple
 import csv
 
-from mechanics import BOARD_SIZE, SUN_POS, SUN_RADIUS, compute_fleet_speed, dist, line_intersects_circle, calculate_score, calculate_interception_angle, is_inner_planet
-
+try:
+	from mechanics import BOARD_SIZE, SUN_POS, SUN_RADIUS, compute_fleet_speed, dist, line_intersects_circle, calculate_score, calculate_interception_angle, is_inner_planet
+except ImportError:
+	from .mechanics import BOARD_SIZE, SUN_POS, SUN_RADIUS, compute_fleet_speed, dist, line_intersects_circle, calculate_score, calculate_interception_angle, is_inner_planet
 @dataclass(frozen=True)
 class PlanetState:
 	id: int
